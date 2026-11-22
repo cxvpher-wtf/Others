@@ -138,6 +138,14 @@ def test_storage_round_trips_and_updates_the_flag(tmp_path):
     assert studio_db.list_scan_folders()[0]["recursive"] is False
 
 
+def test_storage_defaults_to_recursive_on_new_registration(tmp_path):
+    folder = tmp_path / "new_models"
+    folder.mkdir()
+    row, changed = studio_db.add_scan_folder_with_status(str(folder))
+    assert changed and row["recursive"] == 1
+    assert studio_db.list_scan_folders()[0]["recursive"] is True
+
+
 def test_hub_storage_shares_the_flag(tmp_path):
     from hub.storage import scan_folders
 

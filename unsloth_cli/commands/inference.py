@@ -123,8 +123,21 @@ def inference(
         "--no-server",
         help = "Load the model in-process even if an Unsloth server is running.",
     ),
+    models_dir: Optional[List[Path]] = typer.Option(
+        None,
+        "--models-dir",
+        help = "Add a folder of local models to search for models (repeatable).",
+    ),
 ):
     """Run a single inference using the specified model."""
+    if models_dir:
+        from unsloth_cli.commands.studio import _export_models_dirs
+        _export_models_dirs(models_dir)
+        try:
+            from hub.services.models.local_inventory import register_launch_scan_folders
+            register_launch_scan_folders()
+        except Exception:
+            pass
     if not verbose:
         configure_quiet_logging()
 

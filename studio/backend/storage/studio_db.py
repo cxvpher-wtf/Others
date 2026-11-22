@@ -2157,10 +2157,11 @@ def add_scan_folder_with_status(path: str, recursive: bool | None = None) -> tup
             conn.commit()
             return {**dict(existing), "recursive": int(recursive)}, True
         inserted = False
+        initial_recursive = 1 if recursive is None else int(bool(recursive))
         try:
             conn.execute(
                 "INSERT INTO scan_folders (path, created_at, recursive) VALUES (?, ?, ?)",
-                (normalized, now, int(bool(recursive))),
+                (normalized, now, initial_recursive),
             )
             conn.commit()
             inserted = True
