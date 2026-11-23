@@ -403,6 +403,8 @@ def _scan_models_dir(
             )
             if not is_dir and not is_gguf_file:
                 continue
+            if is_dir and child.name.lower() in ("hub", ".locks", "snapshots", "blobs", "modules"):
+                continue
             has_model_files = is_gguf_file or _has_immediate_model_signal(child)
         except OSError:
             continue
@@ -1216,6 +1218,21 @@ async def _collect_models_from_default_sources(
     omlx_dirs: tuple[Path, ...] = (),
 ) -> List[LocalModelInfo]:
     local_models = await _scan_source("models directory", _scan_models_dir, models_root)
+    if _safe_is_dir(hf_cache_dir) and hf_cache_dir.resolve() != models_root.resolve():
+        local_models += await _scan_source(
+            "HF cache models directory", _scan_models_dir, hf_cache_dir
+        )
+    from utils.hf_cache_settings import get_hf_cache_paths
+
+    cache_home = get_hf_cache_paths().cache_home
+    if (
+        _safe_is_dir(cache_home)
+        and cache_home.resolve() != hf_cache_dir.resolve()
+        and cache_home.resolve() != models_root.resolve()
+    ):
+        local_models += await _scan_source(
+            "cache home models directory", _scan_models_dir, cache_home
+        )
     hf_sources = [("HF cache", hf_cache_dir, True)]
 
     if _safe_is_dir(legacy_hf) and legacy_hf.resolve() != hf_cache_dir.resolve():
@@ -1649,6 +1666,11 @@ async def _scan_local_models_response(
     ) = sources
 
     allowed_roots: list[Path] = [Path("./models").resolve(), hf_cache_dir]
+    from utils.hf_cache_settings import get_hf_cache_paths
+
+    cache_home = get_hf_cache_paths().cache_home
+    if _safe_is_dir(cache_home):
+        allowed_roots.append(cache_home)
     if _safe_is_dir(legacy_hf):
         allowed_roots.append(legacy_hf)
     if _safe_is_dir(hf_default):
