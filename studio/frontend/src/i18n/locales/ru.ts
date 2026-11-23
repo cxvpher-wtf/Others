@@ -1039,6 +1039,7 @@ export const ru = {
       customizeProfileMenu: "Настроить меню профиля",
       newBadge: "Новое",
       export: "Экспорт",
+      pinned: "Закреплённые",
       recents: "Недавние",
       noChatsYet: "Пока нет чатов",
       noChats: "Нет чатов",
@@ -1121,6 +1122,10 @@ export const ru = {
       deleteProjectsFilesDescription:
         "Рабочая папка каждого проекта удаляется с диска.",
       countSelected: "Выбрано: {count}",
+      selectChats: "Выбрать чаты",
+      selectAllChats: "Выбрать все чаты",
+      deselectAllChats: "Снять выбор со всех чатов",
+      clearSelection: "Сбросить выбор",
       pinChats: "Закрепить чаты",
       unpinChats: "Открепить чаты",
       archiveChats: "Архивировать чаты",

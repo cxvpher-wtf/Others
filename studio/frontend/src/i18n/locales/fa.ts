@@ -1132,6 +1132,7 @@ export const fa = {
       customizeProfileMenu: "سفارشی‌سازی منوی نمایه",
       newBadge: "جدید",
       export: "خروجی گرفتن",
+      pinned: "سنجاق‌شده",
       recents: "اخیر",
       noChatsYet: "هنوز گفتگویی نیست",
       noChats: "گفتگویی نیست",
@@ -1215,6 +1216,10 @@ export const fa = {
       deleteProjectsFilesDescription:
         "پوشهٔ فضای کار هر پروژه از دیسک حذف می‌شود.",
       countSelected: "{count} مورد انتخاب شده",
+      selectChats: "انتخاب گفتگوها",
+      selectAllChats: "انتخاب همه گفتگوها",
+      deselectAllChats: "لغو انتخاب همه گفتگوها",
+      clearSelection: "پاک کردن انتخاب",
       pinChats: "سنجاق کردن گفتگوها",
       unpinChats: "برداشتن سنجاق گفتگوها",
       archiveChats: "بایگانی گفتگوها",
