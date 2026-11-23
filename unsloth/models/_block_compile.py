@@ -257,6 +257,7 @@ def _packed_kwargs(kwargs):
     get = kwargs.get
     return (
         get("packed_seq_lengths") is not None
+        or get(_PACKED_BLOCK_KWARG) is not None
         or get("cu_seq_lens_q") is not None
         or get("cu_seq_lens_k") is not None
         or get("cu_seqlens") is not None
@@ -272,11 +273,46 @@ def _grad_side_inputs(args, kwargs):
     return False
 
 
+# Bumped on every module / parameter registration (PEFT add_adapter), so cached block parameter
+# lists are rebuilt; None until the global hooks are installed, False if this torch has none.
+_PARAMS_GEN = [None]
+
+
+def _bump_params_gen(*args):
+    _PARAMS_GEN[0] += 1
+
+
+def _watch_registrations():
+    if _PARAMS_GEN[0] is not None:
+        return
+    from torch.nn.modules import module as nn_module
+
+    names = (
+        "register_module_module_registration_hook",
+        "register_module_parameter_registration_hook",
+    )
+    registers = [getattr(nn_module, name, None) for name in names]
+    if any(register is None for register in registers):
+        _PARAMS_GEN[0] = False
+        return
+    _PARAMS_GEN[0] = 0
+    for register in registers:
+        register(_bump_params_gen)
+
+
+def _block_params(layer):
+    d = layer.__dict__
+    params = d.get("_unsloth_block_params")
+    _watch_registrations()
+    gen = _PARAMS_GEN[0]
+    if params is None or (gen is not False and d.get("_unsloth_block_params_gen") != gen):
+        params = d["_unsloth_block_params"] = list(layer.parameters())
+        d["_unsloth_block_params_gen"] = gen
+    return params
+
+
 def _trainable(layer):
-    params = layer.__dict__.get("_unsloth_block_params")
-    if params is None:
-        params = layer.__dict__["_unsloth_block_params"] = list(layer.parameters())
-    return any(p.requires_grad for p in params)
+    return any(p.requires_grad for p in _block_params(layer))
 
 
 # The grad-mode trial before a checkpointed block's first no-grad call stands in for the recompute.
@@ -303,16 +339,20 @@ def _no_output_capture(layer):
         if hasattr(fn, "__wrapped__") and "make_capture_wrapper" in qual:
             swapped.append((module, fn))
             module.forward = fn.__wrapped__
+    # Live collector, trial entries trimmed after: a hidden (None) one compiled a graph no real call reuses.
     try:
         from transformers.utils.output_capturing import _active_collector
+        collected = _active_collector.get()
     except Exception:
-        _active_collector = None
-    token = _active_collector.set(None) if _active_collector is not None else None
+        collected = None
+    lists = []
+    if isinstance(collected, dict):
+        lists = [(v, len(v)) for v in collected.values() if type(v) is list]
     try:
         yield
     finally:
-        if _active_collector is not None:
-            _active_collector.reset(token)
+        for values, length in lists:
+            del values[length:]
         for module, fn in swapped:
             module.forward = fn
 
@@ -434,26 +474,34 @@ def _clone_outputs(out):
     return pytree.tree_map(lambda x: x.clone() if torch.is_tensor(x) else x, out)
 
 
+def _pool_grad_hook(param):
+    ref = weakref.ref(param)
+
+    def hook(grad):
+        p = ref()
+        if p is None or p.grad is not None:
+            return None
+        return grad.clone()
+
+    return hook
+
+
 def _param_grads_out_of_pool(layer):
-    """A first .grad from a replayed backward is graph pool memory the next replay overwrites: copy it."""
-    if layer.__dict__.get("_unsloth_block_grad_hooks", False):
-        return
-    layer.__dict__["_unsloth_block_grad_hooks"] = True
-
-    def hook_for(param):
-        ref = weakref.ref(param)
-
-        def hook(grad):
-            p = ref()
-            if p is None or p.grad is not None:
-                return None
-            return grad.clone()
-
-        return hook
-
-    for param in layer.parameters():
+    """A first .grad from a replayed backward is graph pool memory the next replay overwrites: copy it.
+    Hooks follow requires_grad at each grad-mode call, not the first call: PEFT's set_adapter /
+    disable_adapter flip it, and the first graphed call can be a reference forward (TRL DPO's "ref"
+    adapter, disable_adapter) with the trained adapter frozen."""
+    if not torch.is_grad_enabled():
+        return  # this call makes no parameter gradient
+    hooked = layer.__dict__.get("_unsloth_block_grad_hooks")
+    if not isinstance(hooked, dict):
+        hooked = layer.__dict__["_unsloth_block_grad_hooks"] = {}
+    for param in _block_params(layer):
         if param.requires_grad:
-            param.register_hook(hook_for(param))
+            seen = hooked.get(id(param))
+            if seen is None or seen() is not param:
+                param.register_hook(_pool_grad_hook(param))
+                hooked[id(param)] = weakref.ref(param)
 
 
 def _in_nonreentrant_checkpoint():
@@ -761,10 +809,8 @@ def _region_recompile_limit(kinds):
     return max(16 * kinds + 16, 32)
 
 
-# gpt-oss builds its flex mask inside attention: the block broke and recompiled per length.
-# DeepSeek-V4.1 port: the CSA2 top-k gather is [B, S, min(index_topk, T), D]; Inductor's backward codegen fails on the
-# unbound symbol ("For Min(4, s24), expected [s24] to have been codegen-ed", torch 2.14). Its layers also share a
-# per-forward group-state dict that gradient checkpointing replays per layer.
+# gpt-oss builds its flex mask inside attention, so the block broke and recompiled per length;
+# DeepSeek-V4.1 top-k gather [B, S, min(index_topk, T), D] fails Inductor backward on torch 2.14
 _SKIP = {"GptOssDecoderLayer", "DeepseekV41DecoderLayer"}
 
 
@@ -867,12 +913,7 @@ def _rebind_class(cls):
 
 
 def _relax_strict_dynamic(obj):
-    """Alias tensors that carry a caller's strict mark_dynamic so the block only sees its own maybe marks.
-
-    unsloth_zoo marks input_ids dim 1 for its loss bookkeeping, and Qwen4Exp passes input_ids into every
-    block as ple_input_ids. A length the block specializes then raised ConstraintViolationError and demoted
-    the layer kind to the stock forward. A view drops the mark (it lives on the tensor object), not the data.
-    """
+    """Views drop the strict mark, so a block's specialized length cannot raise ConstraintViolationError."""
     if isinstance(obj, torch.Tensor):
         return obj.view(obj.shape) if getattr(obj, "_dynamo_dynamic_indices", None) else obj
     if type(obj) in (tuple, list):
@@ -913,6 +954,17 @@ def _mark_batch_dynamic(batch, obj):
 
 
 _DYNAMIC_BATCH = os.environ.get("UNSLOTH_BLOCK_COMPILE_DYNAMIC_BATCH", "1") != "0"
+# Per-document metadata of a packed row: one entry per document (+1 for cu_seqlens).
+_PACKED_LENGTH_KWARGS = ("packed_seq_lengths", "cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens")
+
+
+def _mark_packed_dynamic(kwargs):
+    # The document count changes from one packed batch to the next: without the mark every block (and
+    # the attention frame after its graph break) recompiled once on the second packed batch.
+    for key in _PACKED_LENGTH_KWARGS:
+        value = kwargs.get(key)
+        if isinstance(value, torch.Tensor) and value.dim() == 1:
+            torch._dynamo.maybe_mark_dynamic(value, 0)
 
 
 # fla's opaque op state: None until a GatedDeltaNet layer ran its self-check, then True / False.
@@ -958,6 +1010,8 @@ def _gdn_chunk_adapter(original):
         if (
             _GDN_OP[0]
             and torch.compiler.is_compiling()
+            # A prefix-trie row (TRL AsyncGRPO) scans along each sample's path, not the packed order.
+            and "tree_segment_parents" not in kwargs
             and kwargs.get("use_qk_l2norm_in_kernel") is True
             # Only the self-checked default; packed batches only if their self-check passed.
             and (cu_seqlens is None or (_GDN_VARLEN[0] and q.shape[0] == 1))
@@ -1070,6 +1124,7 @@ def _causal_conv1d_adapter(original, depthwise_conv):
             and weight.dim() == 2
             and activation in (None, "silu", "swish")
             and all(kwargs.get(key) is None for key in ("seq_idx", "cu_seqlens", "initial_states"))
+            and "tree_segment_parents" not in kwargs
             and not kwargs.get("return_final_states")
         ):
             out = depthwise_conv(hidden_states.to(weight.dtype), weight)
@@ -1210,11 +1265,7 @@ def _prepare_gdn(layer, hidden_states):
         _GDN_OP[0] = False
 
 
-# PEFT's ParamWrapper (target_parameters on a non-expert weight, e.g. a MoE router) registers a torch
-# parametrization on every forward and removes it after, and torch builds a new Parametrized<Class>
-# subclass per registration. Dynamo guards a module's type id, so each call recompiles the module's
-# forward whenever the fresh class lands at an address it has not seen (how many do depends on the
-# allocator: a different code path shifted the count). One class per module instance keeps the id.
+# A fresh class per PEFT forward would change the type id Dynamo guards, so each module keeps one.
 _PARAMETRIZED_CLASSES = weakref.WeakKeyDictionary()
 
 
@@ -1227,8 +1278,7 @@ def _stable_parametrized_classes():
     if original is None or getattr(original, "_unsloth_stable", False):
         return
 
-    # Eager: the class swap is the graph break PEFT's registration already takes, and Dynamo must
-    # not fold the cache lookup into a graph.
+    # Eager: the swap is the graph break PEFT already takes; Dynamo must not fold the lookup.
     @torch.compiler.disable
     @functools.wraps(original)
     def _inject_new_class(module):
@@ -1341,6 +1391,7 @@ def _gemma4_router_hook():
                 and query.shape[-1] == key.shape[-1] == value.shape[-1]
                 and query.shape[1] % key.shape[1] == 0
                 and _band_kernel_checked(query)
+                and _band_offsets_fit(query, key, value)
             ):
                 # Longer than the window: masked SDPA computes all S x S scores (and repeats the kv
                 # heads); the interval kernel reads only each row's window (O(S * w)).
@@ -1377,6 +1428,16 @@ def _gemma4_router_hook():
 _LONG_BAND_ATTR = "_unsloth_block_long_band"
 _BAND_KERNEL_ENV = "UNSLOTH_BLOCK_SLIDING_KERNEL"
 _LH_MODULE = "unsloth.kernels.large_head_attention"
+
+
+def _band_offsets_fit(query, key, value):
+    lh = sys.modules.get(_LH_MODULE)
+    if lh is None:  # loaded by _band_kernel_checked whenever the kernel can run
+        return True
+    limit = lh._INT32_MAX
+    if max(query.numel(), key.numel(), value.numel()) > limit:
+        return False
+    return max(lh._row_span(query), lh._row_span(key), lh._row_span(value)) <= limit
 
 
 def _band_kernel_attention(query, key, value, window, scaling):
@@ -1486,12 +1547,131 @@ def _precheck_band(
                 setattr(obj, _LONG_BAND_ATTR, False)
 
 
+# transformers drops the mask (None) for unpadded micro batches and dynamo guards on mask vs None, so
+# each flip recompiles. Once a layer has seen a mask, rebuild None in that layout (same SDPA result).
+_MASK_KWARG = "attention_mask"
+_MASK_SPEC = "_unsloth_block_mask_spec"
+_MASK_FLAGS = "_unsloth_block_mask_flags"
+_MATERIALISED_ATTR = "_unsloth_block_materialised"
+_MASK_FLAG_ATTRS = ("_unsloth_block_band", _PLAIN_CAUSAL_ATTR, _LONG_BAND_ATTR)
+# Shared rebuilt mask; held strongly only up to this size.
+_MATERIALISED = [None]
+_MATERIALISED_KEEP_BYTES = 1 << 28
+
+
+def _mask_layout(mask, seq_len):
+    if not isinstance(mask, torch.Tensor) or mask.requires_grad or mask.is_floating_point():
+        return None
+    if mask.is_inference() or getattr(mask, "is_nested", False) or mask.shape[-1] != seq_len:
+        return None
+    if mask.dim() == 2:
+        heads = None
+    elif mask.dim() == 4 and mask.dtype == torch.bool and mask.shape[-2] == seq_len:
+        heads = mask.shape[1]
+    else:
+        return None
+    shape, stride = mask.shape, mask.stride()
+    broadcast = tuple(i for i in range(mask.dim()) if stride[i] == 0 and shape[i] > 1)
+    expected, step = [0] * mask.dim(), 1
+    for i in reversed(range(mask.dim())):
+        if i in broadcast:
+            continue
+        expected[i] = step
+        step *= shape[i]
+    if any(shape[i] > 1 and stride[i] != expected[i] for i in range(mask.dim())):
+        return None
+    # Dynamo also guards a view's base (transformers expands/slices its masks).
+    view = mask._base is not None
+    if view:
+        base = mask._base
+        stored = [1 if i in broadcast else shape[i] for i in range(mask.dim())]
+        if list(base.shape) != stored or not base.is_contiguous():
+            return None
+    elif broadcast:
+        return None
+    return (mask.dim(), mask.dtype, heads, broadcast, view)
+
+
+def _layer_is_causal(layer):
+    attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
+    causal = getattr(attn, "is_causal", None)
+    return causal if isinstance(causal, bool) else None
+
+
+def _materialise_mask(layout, causal, batch, seq_len, device):
+    dim, dtype, heads, broadcast, view = layout
+    key = (layout, causal, batch, seq_len, device)
+    cached = _MATERIALISED[0]
+    if cached is not None and cached[0] == key:
+        mask = cached[1] if cached[2] else cached[1]()
+        if mask is not None:
+            return mask
+    full = (batch, seq_len) if dim == 2 else (batch, heads, seq_len, seq_len)
+    stored = tuple(1 if i in broadcast else size for i, size in enumerate(full))
+    if dim == 4 and causal:
+        # A causal mask needs both token dims stored; a broadcast one (padding-only layout) keeps None.
+        if 2 in broadcast or 3 in broadcast:
+            return None
+        # A fresh tensor in the stored shape (contiguous() keeps a (1, 1, L, L) expand as a view of the 2D base).
+        mask = torch.empty(stored, dtype = torch.bool, device = device)
+        mask.copy_(torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).tril_())
+    else:
+        mask = torch.ones(stored, dtype = dtype if dim == 2 else torch.bool, device = device)
+    if view:
+        mask = mask.expand(full)
+    setattr(mask, _MATERIALISED_ATTR, True)
+    keep = mask.untyped_storage().nbytes() <= _MATERIALISED_KEEP_BYTES
+    _MATERIALISED[0] = (key, mask if keep else weakref.ref(mask), keep)
+    return mask
+
+
+def _normalise_mask(layer, hidden_states, kwargs):
+    if _MASK_KWARG not in kwargs or hidden_states.dim() != 3:
+        return kwargs
+    mask = kwargs[_MASK_KWARG]
+    if mask is not None:
+        if not getattr(mask, _MATERIALISED_ATTR, False):
+            layout = _mask_layout(mask, hidden_states.shape[1])
+            if layout is not None:
+                layer.__dict__[_MASK_SPEC] = layout
+            else:
+                layer.__dict__.pop(_MASK_SPEC, None)
+        return kwargs
+    layout = layer.__dict__.get(_MASK_SPEC)
+    if layout is None or kwargs.get("is_causal") is not None:
+        return kwargs
+    causal = _layer_is_causal(layer) if layout[0] == 4 else None
+    if layout[0] == 4 and causal is None:
+        return kwargs
+    mask = _materialise_mask(
+        layout, causal, hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
+    )
+    return kwargs if mask is None else {**kwargs, _MASK_KWARG: mask}
+
+
+def _settle_mask_flags(layer, kwargs):
+    # Dynamo guards on fast-path flags: keep one only where the last real mask had it.
+    mask = kwargs.get(_MASK_KWARG)
+    if not isinstance(mask, torch.Tensor):
+        return
+    if not getattr(mask, _MATERIALISED_ATTR, False):
+        layer.__dict__[_MASK_FLAGS] = tuple(getattr(mask, name, None) for name in _MASK_FLAG_ATTRS)
+        return
+    flags = layer.__dict__.get(_MASK_FLAGS)
+    for i, name in enumerate(_MASK_FLAG_ATTRS):
+        if hasattr(mask, name):
+            prior = flags[i] if flags is not None else None
+            setattr(mask, name, bool(getattr(mask, name)) and prior is True)
+
+
 # Mode of the block being traced (_SPLIT: flex_attention outside); dynamo guards on it.
 _IN_BLOCK = [0]
 # True only inside Unsloth's own compiled block (fullgraph=False, a graph break is legal), not when the
 # block is inlined into a user's torch.compile, which may be fullgraph=True. Read by unsloth_zoo.
 _IN_COMPILED_REGION = [False]
 _PACKED_MODULE = "unsloth.utils.hf_packed_attention"
+_DISPATCH_MODULE = "unsloth.utils.attention_dispatch"
+_PACKED_BLOCK_KWARG = "_unsloth_packed_varlen"
 _NO_PACKED = [False]
 _OFF, _FULL, _SPLIT = 0, 1, 2
 _DEMOTION = (_FULL, _SPLIT, _OFF)
@@ -1509,12 +1689,54 @@ def _training_flex_options(options):
     return options
 
 
+# Memory-efficient SDPA backward ops (masked training calls).
+_EFFICIENT_SDPA_BACKWARD = (
+    "_scaled_dot_product_efficient_attention_backward",
+    "_efficient_attention_backward",
+)
+
+
+def _efficient_backward_keeps_guard():
+    """CUDA torch < 2.14: without torch's (always true) guard the efficient backward copies the bias densely
+    and faults on padded lengths not a multiple of 8 (`attn_bias is not correctly aligned`)."""
+    from packaging.version import Version
+    return torch.version.hip is None and Version(torch.__version__.split("+")[0]) < Version("2.14")
+
+
+# Cache keys do not see the lowering, so graphs cached without the guard must be invalidated.
+_EFFICIENT_BACKWARD_CACHE_TAG = "unsloth/efficient-backward-guard"
+
+
+def _tag_efficient_backward_cache():
+    config = getattr(torch.compiler, "config", None)
+    if config is None or not isinstance(getattr(config, "cache_key_tag", None), str):
+        return False
+    tags = [t for t in config.cache_key_tag.split(",") if t]
+    if _EFFICIENT_BACKWARD_CACHE_TAG in tags:
+        return True
+    value = ",".join(tags + [_EFFICIENT_BACKWARD_CACHE_TAG])
+    try:
+        from ..kernels.triton_launch import set_torch_config, sync_compile_cache_tag_to_workers
+    except Exception:
+        setattr(config, "cache_key_tag", value)
+        return True
+    # Every thread: a reentrant checkpoint recompiles its grad graph on autograd's device thread.
+    set_torch_config(config, "cache_key_tag", value)
+    sync_compile_cache_tag_to_workers()
+    return True
+
+
 def _sdpa_alignment_without_guard():
     """Stop Inductor recompiling a block per `seq_len % 8` class: inside torch 2.14's SDPA lowering only,
     `guard_or_false` becomes `statically_known_true` (False is its documented safe answer), so a dynamic length
     takes the general unaligned path instead of installing a `Mod(s, 8)` guard (20-44 s recompile per layer kind).
+    The memory-efficient backward keeps torch's guard where it needs it (_efficient_backward_keeps_guard).
     UNSLOTH_BLOCK_SDPA_ALIGN_GUARD=1 keeps torch's guards."""
     if os.environ.get("UNSLOTH_BLOCK_SDPA_ALIGN_GUARD", "0") == "1":
+        if _efficient_backward_keeps_guard():
+            # Stock lowering, but the same cache key as a run without the guard before the tag existed:
+            # tag it too, or that run's faulting efficient backward is served again.
+            _tag_efficient_backward_cache()
         return False
     try:
         import torch._inductor.lowering as lowering
@@ -1532,9 +1754,18 @@ def _sdpa_alignment_without_guard():
         SizeVarAllocator, "guard_or_false"
     ):
         return False
+    guarded = set()
+    if _efficient_backward_keeps_guard():
+        for name in _EFFICIENT_SDPA_BACKWARD:
+            packet = getattr(torch.ops.aten, name, None)
+            if packet is not None and hasattr(packet, "default"):
+                guarded.add(packet.default)
+        _tag_efficient_backward_cache()
 
     @functools.wraps(original)
     def sdpa_constraint(*args, **kwargs):
+        if args and getattr(args[0], "target", None) in guarded:
+            return original(*args, **kwargs)
         sizevars = V.graph.sizevars
         shadowed = "guard_or_false" in sizevars.__dict__
         previous = sizevars.__dict__.get("guard_or_false")
@@ -1694,9 +1925,7 @@ _CHECKPOINT_CACHE_KWARGS = ("past_key_values", "layer_past")
 
 
 def _checkpointing(forward):
-    """transformers' layer checkpoint wrapper around the block forward. The block replaces the class
-    forward, so transformers' own wrapper (now inside the block) never saw itself as outermost and
-    every layer ran without gradient checkpointing (gemma-4-12b QLoRA 2048: 16 GB kept, 8192: OOM)."""
+    """The block's forward hides transformers' checkpoint wrapper, so layers ran without checkpointing."""
 
     @functools.wraps(forward)
     def forward_with_checkpointing(self, *args, **kwargs):
@@ -1716,6 +1945,25 @@ def _checkpointing(forward):
         return forward(self, *args, **kwargs)
 
     return forward_with_checkpointing
+
+
+def _fast_lora():
+    from ..kernels import fast_lora
+    return fast_lora
+
+
+def _skip_down_eligible(layer, original):
+    try:
+        return _fast_lora().block_skip_down_eligible(layer, original)
+    except Exception:
+        return False
+
+
+def _replays(layer):
+    try:
+        return _fast_lora()._replay_module() is layer
+    except Exception:
+        return False
 
 
 def _wrap(
@@ -1797,9 +2045,22 @@ def _wrap(
 
     graph_shapes = set()
 
-    def run(self, hidden_states, args, kwargs, mode):
+    def run(
+        self,
+        hidden_states,
+        args,
+        kwargs,
+        mode,
+        skip_down = False,
+        trial = False,
+    ):
         kwargs, shared = _shared_kv_scratch(self, kwargs)
+        if skip_down:
+            # Call scoped: only this call's tagged layer forward and fused MLP see it (no global, no thread).
+            kwargs = {**kwargs, "_unsloth_skip_down": True}
         out = _run(self, hidden_states, args, kwargs, mode)
+        if skip_down and not trial:
+            _fast_lora().MLP_DOWN_SKIP_STATS["skipped"] += 1
         if shared is not None:
             shared[0].update(shared[1])
         return out
@@ -1890,6 +2151,8 @@ def _wrap(
 
     @functools.wraps(original)
     def forward(self, hidden_states, *args, **kwargs):
+        # Set only on the grad-mode trial call below: it compiles the skip graph the replay will use.
+        trial = kwargs.pop("_unsloth_skip_trial", False)
         tracing = torch.compiler.is_compiling()
         mode = self.__dict__.get("_unsloth_block_mode")
         if mode is None:
@@ -1897,17 +2160,25 @@ def _wrap(
             if not tracing:
                 self.__dict__["_unsloth_block_mode"] = mode
         # Training only: eval logits stay bit-equal to transformers.
-        if (
+        stock = (
             mode == _OFF
             or not self.training
             or _has_cache(args, kwargs)
             or not _enabled()
             or _forced_float32(self)
             or _zero3_partitioned(self)
-            or (unsloth_forward and kwargs.get("packed_seq_lengths") is not None)
             # PrefixGrouper's int segment table would recompile at every new GRPO length.
-            or (unsloth_forward and kwargs.get("prefix_seg_info") is not None)
-        ):
+            or kwargs.get("prefix_seg_info") is not None
+        )
+        if not stock and unsloth_forward and kwargs.get("packed_seq_lengths") is not None:
+            # Packed lengths -> device cu_seqlens; no traceable varlen kernel keeps the stock forward.
+            prepare = getattr(sys.modules.get(_DISPATCH_MODULE), "prepare_packed_block", None)
+            prepared = None if tracing or prepare is None else prepare(self, hidden_states, kwargs)
+            if prepared is None:
+                stock = True
+            else:
+                kwargs = prepared
+        if stock:
             phase = _CUDAGRAPH_STATE["auto"]["phase"] if auto else None
             if (
                 (graphs or phase == "on")
@@ -1937,20 +2208,31 @@ def _wrap(
         if _GDN_OP[0] is None and hasattr(self, "linear_attn"):
             _prepare_gdn(self, hidden_states)
         if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
+            kwargs = _normalise_mask(self, hidden_states, kwargs)
             hidden_states, args, kwargs = _relax_strict_dynamic((hidden_states, args, kwargs))
             _mark_seq_dynamic(hidden_states.shape[1], (hidden_states, args, kwargs))
             if _DYNAMIC_BATCH and hidden_states.shape[0] > 1:
                 _mark_batch_dynamic(hidden_states.shape[0], (hidden_states, args, kwargs))
+            _mark_packed_dynamic(kwargs)
             _precheck_band(self, hidden_states.shape[1], args, kwargs, hidden_states)
-        bit = 2 if torch.is_grad_enabled() else 1
+            _settle_mask_flags(self, kwargs)
+        # Grad-mode graphs: bit 2 runs every op, bit 4 skips the MLP down projection (a gradient checkpoint
+        # replay of exactly this layer, whose output value its backward never reads). A no-grad call (the
+        # checkpointed forward) of an eligible layer trials the graph its replay will use.
+        skip_down = _skip_down_eligible(self, original)
+        if torch.is_grad_enabled():
+            skip_down = skip_down and (trial or _replays(self))
+            bit = 4 if skip_down else 2
+        else:
+            bit = 1
+        trial_bit = 4 if bit == 1 and skip_down else 2
         checked = self.__dict__.get("_unsloth_block_checked", 0)
         nonreentrant = (
             bit == 2 and not checked & 2 and not _IN_TRIAL[0] and _in_nonreentrant_checkpoint()
         )
-        if (bit == 1 or nonreentrant) and not checked & 2:
-            # Grad-mode trial first (RNG forked): a checkpoint recompute must not demote below this call.
-            # Non-reentrant: identity saved-tensor hooks (innermost wins) keep a failed attempt's partly
-            # run graph out of the checkpoint, else its saved count differs from the recompute's.
+        if (bit == 1 or nonreentrant) and not checked & trial_bit:
+            # Grad-mode trial runs first (RNG forked); a checkpoint recompute must not demote below
+            # this call. Non-reentrant: identity saved-tensor hooks keep a failed trial graph out
             devices = [hidden_states.device.index] if hidden_states.is_cuda else []
             hooks = (
                 torch.autograd.graph.saved_tensors_hooks(_same, _same)
@@ -1965,19 +2247,26 @@ def _wrap(
             ):
                 _IN_TRIAL[0] = "nonreentrant" if nonreentrant else True
                 try:
-                    forward(self, hidden_states.detach().requires_grad_(), *args, **kwargs)
+                    forward(
+                        self,
+                        hidden_states.detach().requires_grad_(),
+                        *args,
+                        _unsloth_skip_trial = not nonreentrant,
+                        **kwargs,
+                    )
                 finally:
                     _IN_TRIAL[0] = False
             mode = self.__dict__["_unsloth_block_mode"]
             if mode == _OFF:
                 return original(self, hidden_states, *args, **kwargs)
             checked = self.__dict__.get("_unsloth_block_checked", 0)
+        skip_down = bit == 4
         if checked & bit:
-            return run(self, hidden_states, args, kwargs, mode)
+            return run(self, hidden_states, args, kwargs, mode, skip_down, trial)
         while True:
             try:
                 with _strict_dynamo():
-                    out = run(self, hidden_states, args, kwargs, mode)
+                    out = run(self, hidden_states, args, kwargs, mode, skip_down, trial)
                 self.__dict__["_unsloth_block_checked"] = checked | bit
                 return out
             except torch.OutOfMemoryError:
@@ -2245,9 +2534,8 @@ def _install_router_capture_hooks(model):
     ):
         return 0
     installed = 0
-    # Outermost first, as transformers would: an install recurses into nested models and flags them. Its
-    # recursion does not check that flag, so a module with an already hooked descendant (an earlier eager
-    # capturing forward) is skipped: installing it would hook that descendant twice (duplicated outputs).
+    # Outermost first, as transformers does; skip modules with a hooked descendant (no double
+    # hooks).
     for module in model.modules():
         # dict.get: 5.23's _CanRecordRegistry.get expects the model and returned {} for a string (transformers#49594).
         flags = dict.get(registry, str(type(module))) or {}
@@ -2261,6 +2549,21 @@ def _install_router_capture_hooks(model):
         except Exception:
             pass
     return installed
+
+
+def _rebind_hooked_instances(model, cls, before):
+    """accelerate's device-map hooks (a model split over GPUs) call the forward bound at load, `_old_forward`, not
+    the class attribute. Left there, transformers' >= 5.23 checkpoint wrapper sees it is no longer the class forward
+    and runs the stock layer with neither checkpointing nor the compiled block: point them at the installed forward."""
+    rebound = 0
+    for module in model.modules():
+        if type(module) is not cls:
+            continue
+        old = module.__dict__.get("_old_forward")
+        if old is not None and getattr(old, "__func__", None) is before:
+            module._old_forward = types.MethodType(cls.forward, module)
+            rebound += 1
+    return rebound
 
 
 def patch_block_compile(model):
@@ -2328,8 +2631,10 @@ def patch_block_compile(model):
     for cls in classes:
         if getattr(cls.forward, _MARK, False):
             continue
+        before = cls.forward
         _wrap(cls, _COMPILE_OPTIONS, len(kinds.get(cls, ())) or 1)
         wrapped.append(cls.__name__)
+        _rebind_hooked_instances(model, cls, before)
     for layer in compiled_layers:
         if not any(m.__dict__.get("_unsloth_fp8_lora") is not None for m in layer.modules()):
             continue

@@ -68,8 +68,7 @@ def _qkv(index, D = 128):
 def test_int8_attention_launches_on_the_operands_card(card, monkeypatch, pv, fused):
     state, log = card
     if pv == "half" and (not torch.backends.cuda.is_built() or 0 < torch.cuda.device_count() < 2):
-        # The fake copy into the half V buffer reaches the CUDA runtime: it needs a CUDA build, and with real GPUs
-        # present, a real second card behind cuda:1.
+        # Half-V fake reaches CUDA: needs a CUDA build, and cuda:1 when any GPU is present.
         pytest.skip("the fake half V copy needs a CUDA build and, with GPUs present, a second card")
     if not fused:
         monkeypatch.setattr(T, "GRID_LIMIT", 0)
@@ -125,3 +124,10 @@ def test_dispatcher_runs_the_triton_path_on_the_operands_card(card, monkeypatch)
     assert [n for n, _ in log] == ["prep", "kv", "attn"]
     assert {d for _, d in log} == {1}
     assert checks == [] and state["device"] == 0
+
+
+def test_fast_launch_is_off_without_triton(monkeypatch):
+    # The direct launch reads triton.runtime; a host without Triton (the CPU CI legs) must take the regular launch.
+    monkeypatch.setattr(T, "triton", None)
+    monkeypatch.setitem(T._FAST_LAUNCH, "ok", True)
+    assert T._fast_launch_ok() is False

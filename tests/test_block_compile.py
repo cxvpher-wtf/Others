@@ -122,6 +122,144 @@ def test_batch_change_does_not_recompile(monkeypatch, dynamic_batch):
         assert extra >= 1  # the control: without the batch mark the batch change recompiles
 
 
+class _MaskDecoderLayer(torch.nn.Module):
+    """SDPA over a mask that transformers drops (None) for an unpadded micro batch."""
+
+    def __init__(self, causal = True):
+        super().__init__()
+        self.proj = torch.nn.Linear(8, 8)
+        self.self_attn = types.SimpleNamespace(is_causal = causal)
+        self.causal = causal
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask = None,
+        **kwargs,
+    ):
+        q = self.proj(hidden_states)[:, None]
+        if attention_mask is None:
+            out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = self.causal)
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, q, q, attn_mask = attention_mask
+            )
+        return out[:, 0]
+
+
+def _compile_counter(monkeypatch):
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    real_compile = torch.compile
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda fn, **kwargs: real_compile(fn, backend = counter, fullgraph = False, dynamic = None),
+    )
+    torch._dynamo.reset()
+    return counter
+
+
+def _padded_mask(
+    lengths,
+    L,
+    causal = True,
+):
+    keep = torch.arange(L)[None] < torch.tensor(lengths)[:, None]
+    base = torch.ones(L, L, dtype = torch.bool)
+    if causal:
+        base = base.tril()
+    return base[None, None] & keep[:, None, None, :]
+
+
+@pytest.mark.parametrize("causal", [True, False], ids = ["causal", "bidirectional"])
+def test_unpadded_batch_reuses_the_masked_graph(monkeypatch, causal):
+    """Padded vs unpadded micro batches must not flip mask/None and recompile."""
+    M = _load()
+    counter = _compile_counter(monkeypatch)
+    M._wrap(_MaskDecoderLayer, {})
+    layer = _MaskDecoderLayer(causal).train()
+    reference = _MaskDecoderLayer(causal).train()
+    reference.load_state_dict(layer.state_dict())
+
+    def step(lengths, L, padded):
+        x = torch.randn(len(lengths), L, 8)
+        mask = _padded_mask(lengths, L, causal) if padded else None
+        xs = x.clone().requires_grad_()
+        out = layer(xs, attention_mask = mask)
+        out.square().sum().backward()
+        xr = x.clone().requires_grad_()
+        ref = _MaskDecoderLayer.forward.__wrapped__(reference, xr, attention_mask = mask)
+        ref.square().sum().backward()
+        torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-5)
+        torch.testing.assert_close(xs.grad, xr.grad, rtol = 1e-5, atol = 1e-5)
+
+    step([16, 12], 16, True)
+    step([20, 17], 20, True)
+    before = counter.frame_count
+    step([24, 24], 24, False)
+    step([18, 9], 18, True)
+    step([14, 14], 14, False)
+    extra = counter.frame_count - before
+    torch._dynamo.reset()
+    assert extra == 0
+
+
+def test_mask_rebuilt_only_after_a_mask_was_seen(monkeypatch):
+    M = _load()
+    layer = _MaskDecoderLayer().train()
+    hidden = torch.zeros(2, 6, 8)
+    assert M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"] is None
+    layer.self_attn = types.SimpleNamespace()
+    M._normalise_mask(layer, hidden, {"attention_mask": _padded_mask([6, 4], 6)})
+    assert M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"] is None
+    M._normalise_mask(layer, hidden, {"attention_mask": torch.tensor([[1] * 6, [1] * 4 + [0] * 2])})
+    rebuilt = M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"]
+    assert rebuilt.dtype == torch.long and rebuilt.shape == (2, 6) and bool((rebuilt == 1).all())
+    # transformers expands its 4D mask (a view) and dynamo guards the base: the rebuilt mask is a view too.
+    layer.self_attn = types.SimpleNamespace(is_causal = True)
+    M._normalise_mask(
+        layer, hidden, {"attention_mask": _padded_mask([6, 4], 6).expand(2, -1, 6, 6)}
+    )
+    rebuilt = M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"]
+    assert rebuilt._base is not None and rebuilt._base.shape == rebuilt.shape
+    assert torch.equal(rebuilt, torch.ones(6, 6, dtype = torch.bool).tril().expand(2, 1, 6, 6))
+    M._normalise_mask(layer, hidden, {"attention_mask": _padded_mask([6, 4], 6).contiguous()})
+    assert (
+        M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"]._base is None
+    )
+    padding = torch.tensor([[True] * 6, [True] * 4 + [False] * 2])[:, None, None, :].clone()
+    for causal, want in ((False, torch.ones(2, 1, 6, 6, dtype = torch.bool)), (True, None)):
+        layer = _MaskDecoderLayer().train()
+        layer.self_attn = types.SimpleNamespace(is_causal = causal)
+        M._MATERIALISED[0] = None
+        M._normalise_mask(layer, hidden, {"attention_mask": padding.expand(2, 1, 6, 6)})
+        rebuilt = M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"]
+        assert rebuilt is None if want is None else torch.equal(rebuilt, want)
+    # Batch size 1: the rebuilt causal mask owns its storage (no 2D base dynamo would guard as a view).
+    layer = _MaskDecoderLayer().train()
+    layer.self_attn = types.SimpleNamespace(is_causal = True)
+    M._MATERIALISED[0] = None
+    one = torch.zeros(1, 6, 8)
+    M._normalise_mask(layer, one, {"attention_mask": _padded_mask([6], 6).contiguous()})
+    rebuilt = M._normalise_mask(layer, one, {"attention_mask": None})["attention_mask"]
+    assert rebuilt._base is None and torch.equal(
+        rebuilt, torch.ones(6, 6, dtype = torch.bool).tril()[None, None]
+    )
+    assert (
+        M._normalise_mask(layer, one, {"attention_mask": None, "is_causal": False})[
+            "attention_mask"
+        ]
+        is None
+    )
+    layer = _MaskDecoderLayer().train()
+    M._MATERIALISED[0] = None
+    M._normalise_mask(layer, hidden, {"attention_mask": torch.tensor([[1], [0]]).expand(2, 6)})
+    rebuilt = M._normalise_mask(layer, hidden, {"attention_mask": None})["attention_mask"]
+    assert torch.equal(rebuilt, torch.ones(2, 6, dtype = torch.long))
+
+
 def test_rebind_globals_resolves():
     M = _load()
     ns = {"__name__": "not_a_registered_module", "OFFSET": 3}
@@ -644,6 +782,38 @@ def test_unsloth_host_metadata_calls_keep_the_stock_forward(monkeypatch, key):
     assert calls  # no host metadata: compiled
 
 
+def test_prefix_grouper_table_keeps_the_stock_forward_on_transformers_layers(monkeypatch):
+    """prefix_grouper_hf passes the table through transformers-native layers too (Qwen3-MoE)."""
+    M = _load()
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        def compiled(*args, **kw):
+            calls.append(1)
+            return fn(*args, **kw)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    class Qwen3MoeDecoderLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(8, 8)
+
+        def forward(self, hidden_states, **kwargs):
+            return self.proj(hidden_states)
+
+    Qwen3MoeDecoderLayer.forward.__module__ = "transformers.models.qwen3_moe.modeling_qwen3_moe"
+    M._wrap(Qwen3MoeDecoderLayer, {})
+    layer = Qwen3MoeDecoderLayer().train()
+    x = torch.randn(1, 4, 8)
+    layer(x, prefix_seg_info = object())
+    assert calls == []
+    layer(x, prefix_seg_info = None)
+    assert calls  # no table: compiled
+
+
 def test_packed_stock_forward_says_blocks_run_uncompiled(monkeypatch, capsys):
     M = _load()
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
@@ -907,6 +1077,34 @@ def test_gemma4_long_band_routes_to_the_interval_kernel(monkeypatch):
     assert len(kernel) == 1 and len(calls["plain"]) == 3
 
 
+def test_gemma4_long_band_past_int32_keeps_the_plain_route(monkeypatch):
+    M = _load()
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    scans = []
+    calls, _ = _fake_gemma4_router_stack(M, monkeypatch, scans)
+    M._gemma4_router_hook()
+    wrapped = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    _, attn = _sliding_layer(window = 16, head_dim = 32)
+    monkeypatch.setattr(M, "_band_kernel_attention", lambda q, k, v, w, s: "kernel")
+    monkeypatch.setattr(M, "_band_kernel_checked", lambda q: True)
+    import importlib
+
+    lh = importlib.import_module(M._LH_MODULE)
+    q = torch.randn(1, 4, 48, 32, dtype = torch.bfloat16)
+    kv = torch.randn(1, 2, 48, 32, dtype = torch.bfloat16)
+    mask = torch.zeros(1, 1, 48, 48)
+    mask._unsloth_block_long_band = True
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    M._IN_BLOCK[0] = M._FULL
+    try:
+        assert wrapped(attn, q, kv, kv, mask, scaling = 1.0)[0] == "kernel"
+        monkeypatch.setattr(lh, "_INT32_MAX", q.numel() - 1)
+        assert wrapped(attn, q, kv, kv, mask, scaling = 1.0)[0] == "plain"
+    finally:
+        M._IN_BLOCK[0] = M._OFF
+
+
 def test_kill_switch(monkeypatch):
     M = _load()
     monkeypatch.setenv("UNSLOTH_BLOCK_COMPILE", "0")
@@ -1118,6 +1316,58 @@ def test_trial_forward_is_not_recorded_as_a_model_output(monkeypatch, style):
             from transformers.utils.output_capturing import _active_collector
             _active_collector.reset(token)
     assert len(recorded) == 1, f"{len(recorded)} recorded outputs for one forward"
+
+
+class _TraceableCollector:
+    """unsloth_zoo's compiled-code mirror of transformers' collector: dynamo traces get() and guards on it."""
+
+    def __init__(self):
+        self.value = None
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        old, self.value = self.value, value
+        return old
+
+    def reset(self, token):
+        self.value = token
+
+
+def test_trial_forward_graph_is_reused_by_the_real_call(monkeypatch):
+    # tiny Gemma-4 vision: a trial hidden from the collector (None) compiled graphs no real call matched.
+    from torch._dynamo.utils import counters
+
+    output_capturing = pytest.importorskip("transformers.utils.output_capturing")
+    M = _load()
+    real_compile = torch.compile
+
+    def eager_compile(fn, **kwargs):
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("options", "backend")}
+        return real_compile(fn, backend = "eager", **kwargs)
+
+    monkeypatch.setattr(torch, "compile", eager_compile)
+    collector = _TraceableCollector()
+    monkeypatch.setattr(output_capturing, "_active_collector", collector)
+    cls = _toy_class()
+    M._wrap(cls, {})
+    layer = cls()
+
+    def hook(module, args, output):
+        collected = output_capturing._active_collector.get()
+        if collected is not None and "attentions" in collected:
+            collected["attentions"].append(output)
+
+    layer.proj.register_forward_hook(hook)
+    collector.set({})  # capture_outputs with nothing requested
+    torch._dynamo.reset()
+    counters.clear()
+    x = torch.randn(2, 4, 8)
+    with torch.no_grad():  # reentrant checkpoint forward: grad-mode trial, then the real call
+        layer(x)
+    layer(x.requires_grad_()).sum().backward()  # the recompute
+    assert counters["stats"]["unique_graphs"] == 2, dict(counters["stats"])
 
 
 def test_gdn_self_check_leaves_default_rng_alone():
@@ -2018,13 +2268,10 @@ def test_zero3_partitioned_training_keeps_the_stock_forward(monkeypatch):
 
 
 def test_router_logits_after_a_forward_without_them(request, monkeypatch):
-    """transformers installs the router_logits hooks on the first forward that asks for them.
-
-    Dynamo does not guard on module hooks (skip_nnmodule_hook_guards), so a block compiled during an
-    earlier forward without output_router_logits kept running without the gate hook: no router logits,
-    and the aux loss raised IndexError in load_balancing_loss_func. The hooks now exist before the
-    first block compiles, and the hook body (guarded on the collector keys) decides per call.
-    """
+    """transformers installs router_logits hooks on first forward asking; Dynamo does not guard
+    hooks (skip_nnmodule_hook_guards), so a block compiled earlier lost its gate hook (IndexError
+    in load_balancing_loss_func); hooks exist before compile; hook body (guarded on collector
+    keys) decides per call."""
     misc = pytest.importorskip("unsloth_zoo.temporary_patches.misc")
     if not hasattr(misc, "output_capture_scratch"):
         pytest.skip("needs an unsloth_zoo with output_capture_scratch (unsloth-zoo#2041)")
@@ -2058,9 +2305,8 @@ def test_router_logits_after_a_forward_without_them(request, monkeypatch):
 
 @pytest.mark.parametrize("registry_kind", ["dict", "model_keyed"])
 def test_router_hooks_install_with_either_registry_api(monkeypatch, registry_kind):
-    """transformers 5.23 (huggingface/transformers#49594) made _CAN_RECORD_REGISTRY a dict subclass whose
-    .get takes the model and stringifies its class, so .get(<class string>) answered {} and no router hook
-    was installed up front (the IndexError above came back). Keys are still the class strings."""
+    """transformers 5.23 (huggingface/transformers#49594) made _CAN_RECORD_REGISTRY.get take the
+    model, so a class-string get returned {} and no router hook was installed."""
     M = _load()
 
     class Registry(dict):
@@ -2399,9 +2645,8 @@ def test_relax_strict_dynamic_aliases_only_marked_tensors():
 
 
 def test_strict_marked_kwarg_does_not_demote_the_block(monkeypatch, capsys):
-    """Qwen4Exp passes input_ids (strictly marked by unsloth_zoo's loss bookkeeping) into every block as
-    ple_input_ids; a length the block specialized raised ConstraintViolationError and the layer kind fell
-    back to the stock forward."""
+    """Qwen4Exp passes input_ids (strictly marked by unsloth_zoo's loss bookkeeping) as
+    ple_input_ids; a specialized length raised ConstraintViolationError, demoting the layer."""
     M = _load()
     real_compile = torch.compile
     monkeypatch.setattr(
@@ -2473,8 +2718,7 @@ def _checkpointed_layer(cls, reentrant = False):
 
 
 def test_block_keeps_transformers_layer_checkpointing(monkeypatch):
-    # The block replaced the class forward, so transformers' wrapper ended up inside it, never saw
-    # itself as type(self).forward and every layer trained without checkpointing.
+    # The block replaced the class forward, hiding transformers' wrapper, so nothing was checkpointed.
     M = _load()
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
     cls = _toy_class()
@@ -2493,8 +2737,7 @@ def test_block_keeps_transformers_layer_checkpointing(monkeypatch):
     M._wrap(cls, {})
     layer.train()(x)
     assert calls == [1, 1]
-    # A reentrant checkpoint's no-grad first call runs the block's grad-mode trial, which must call
-    # the block, not the checkpoint shim again (that recursed until RecursionError).
+    # The grad-mode trial must call the block, not the checkpoint shim (that recursed until RecursionError).
     fresh, fresh_calls = _checkpointed_layer(cls, reentrant = True)
     out = fresh(x)
     torch.testing.assert_close(out, fresh.proj(x) + x)
@@ -2569,3 +2812,34 @@ def test_opaque_gdn_op_takes_any_fla_return_length(monkeypatch, extra_fwd):
     torch.testing.assert_close(out[0], v.detach() * 0.5)
     out[0].sum().backward()
     assert torch.all(v.grad == 0.5) and torch.all(q.grad == 1) and torch.all(g.grad == 4)
+
+
+def test_block_keeps_checkpointing_under_accelerate_device_map_hooks(monkeypatch):
+    # A model split over GPUs: accelerate's hook calls `_old_forward`, bound at load to transformers' wrapper. After
+    # the block replaced the class forward that wrapper stopped checkpointing (and the block never ran), so every
+    # layer kept its activations: Inkling-2-Mini on 2x T4 grew ~0.45 GB per layer and ran out of memory.
+    hooks = pytest.importorskip("accelerate.hooks")
+    M = _load()
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
+    cls = _toy_class()
+    stock = cls.forward
+    cls.forward = _like_transformers_5_23(stock)
+    layer, calls = _checkpointed_layer(cls)
+    hooks.add_hook_to_module(layer, hooks.ModelHook())
+    before = cls.forward
+    M._wrap(cls, {})
+    x = torch.randn(1, 4, 8, requires_grad = True)
+    layer(x)
+    assert calls == []  # the stale bound wrapper: no checkpoint
+    holder = torch.nn.Module()
+    holder.layer = layer
+    assert M._rebind_hooked_instances(holder, cls, before) == 1
+    out = layer(x)
+    torch.testing.assert_close(out, layer.proj(x) + x)
+    assert calls == [1]
+    # Unhooked instances and other classes are left alone.
+    plain, plain_calls = _checkpointed_layer(cls)
+    holder.plain = plain
+    assert M._rebind_hooked_instances(holder, cls, before) == 0
+    plain(x)
+    assert plain_calls == [1]

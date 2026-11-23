@@ -116,13 +116,16 @@ def _config(**over):
         text["engram_vocab_size"],
     )
     text["engram_num_embeddings"] = [o[-1] + p[-1][-1] for o, p in zip(offsets, primes)]
-    return DeepseekV41Config(text_config = text)
+    # the release keeps a vision_config for a model class with no vision tower or image input
+    return DeepseekV41Config(text_config = text, vision_config = {"model_type": "deepseek_v41_vision"})
 
 
 def build(
     seed = 0,
     lora = True,
     dropout = 0.0,
+    experts = False,
+    gc = False,
     **over,
 ):
     from peft import LoraConfig, get_peft_model
@@ -155,11 +158,23 @@ def build(
     # The indexer selects (no gradient) and the router stays frozen.
     regex = r"^(?!.*\.indexer\.)(?!.*\.gate\.).*\.(" + "|".join(sorted(names)) + r")$"
     config = LoraConfig(
-        r = 4, lora_alpha = 8, target_modules = regex, init_lora_weights = False, lora_dropout = dropout
+        r = 4,
+        lora_alpha = 8,
+        target_modules = regex,
+        init_lora_weights = False,
+        lora_dropout = dropout,
+        # routed experts (packed 3D parameters) through PEFT's ParamWrapper
+        target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+        if experts
+        else None,
     )
     assert register_grouped_linear_lora(config, model)
     torch.manual_seed(seed + 1)
-    return get_peft_model(model, config)
+    model = get_peft_model(model, config)
+    if gc:
+        # zoo's decoder layer replay, non-reentrant (as use_gradient_checkpointing = "unsloth" runs it)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    return model
 
 
 def batch(bsz = 2):
@@ -183,10 +198,11 @@ def _reference(
     parts,
     steps,
     dropout = 0.0,
+    **variant,
 ):
     from peft import get_peft_model_state_dict
 
-    model = build(dropout = dropout)
+    model = build(dropout = dropout, **variant)
     opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 1e-2)
     per = ids.shape[0] // parts
     chunks = [(ids[i * per : (i + 1) * per], labels[i * per : (i + 1) * per]) for i in range(parts)]
@@ -214,6 +230,14 @@ def _reference(
     return {"losses": losses, "grads": grads, "trainable": trainable, "state": state}
 
 
+def _replay_runs():
+    try:
+        from unsloth_zoo.temporary_patches.deepseek_v41 import REPLAY_STATS
+    except Exception:
+        return 0
+    return REPLAY_STATS["runs"]
+
+
 def _local_shape(t):
     return tuple(t.to_local().shape) if hasattr(t, "to_local") else tuple(t.shape)
 
@@ -229,6 +253,8 @@ def _case_parity(
     fault = None,
     layers_per_stage = None,
     dropout = 0.0,
+    experts = False,
+    gc = False,
 ):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
@@ -236,10 +262,25 @@ def _case_parity(
     bsz = max(2, world) if mode == "fsdp2" else (max(2, n_mb) if mode == "pp" else 2)
     ids, labels = batch(bsz)
     parts = world if mode == "fsdp2" else n_mb
-    ref = _reference(mode, ids, labels, parts, steps, dropout)
+    variant = dict(experts = experts, gc = gc)
+    if gc:
+        # unsloth_zoo on its CPU backend, patched before either model is built (as a run imports it first)
+        os.environ["UNSLOTH_FORCE_CPU"] = "1"
+        assert dsv41.ensure_checkpoint_replay()
+    ref = _reference(mode, ids, labels, parts, steps, dropout, **variant)
+    if fault == "reentrant_no_replay":
+        # a plain reentrant checkpoint: the shared KV a source layer writes is made under no_grad
+        def plain(self, *args, **kwargs):
+            return dsv41.GradientCheckpointingLayer.__call__(self, *args, **kwargs)
+
+        plain._unsloth_patched = True  # ensure_checkpoint_replay keeps it
+        dsv41.DeepseekV41DecoderLayer.__call__ = plain
+    replays = _replay_runs()
     model = build(
-        dropout = dropout
+        dropout = dropout, **variant
     )  # LoRA dropout: the same RNG draws as the reference, in the same order
+    if fault == "reentrant_no_replay":
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
     mesh = init_device_mesh("cpu", (world,), mesh_dim_names = (mode,))[mode]
     save_dir = os.path.join(tmp, "adapter")
     info = {}
@@ -293,6 +334,22 @@ def _case_parity(
         layers = model.get_base_model().model.layers
         info["owned"] = [i for i, layer in enumerate(layers) if "_pp_index" not in layer.__dict__]
         info["stage_forward"] = pp.ctx.stage_forward is not None
+        decoder = model.get_base_model().model
+        stage_fn, info["stage_calls"] = decoder.pipeline_stage_forward, []
+
+        def counted(*args, **kwargs):
+            info["stage_calls"].append(1)
+            return stage_fn(*args, **kwargs)
+
+        decoder.pipeline_stage_forward = counted
+        names = {id(p): n for n, p in model.named_parameters()}
+        info["param_layers"] = sorted(
+            {
+                int(names[id(p)].split(".layers.")[1].split(".")[0])
+                for p in params
+                if ".layers." in names[id(p)]
+            }
+        )
     opt = torch.optim.SGD(params, lr = 1e-2)
     losses, grads = [], None
     for s in range(steps):
@@ -310,6 +367,8 @@ def _case_parity(
         else:
             losses.append(None if loss is None else float(loss))
     if mode == "pp":
+        info["stage_calls"] = len(info["stage_calls"])
+        info["replays"] = _replay_runs() - replays
         pp.save_adapter(save_dir)
     elif mode == "tp":
         tpn.save_tp_adapter(model, save_dir)
@@ -344,7 +403,92 @@ def _case_attention_units(rank, world, tmp):
     return {"error": None}
 
 
-CASES = {"parity": _case_parity, "attention_units": _case_attention_units}
+def _naive_clip(
+    parameters,
+    max_norm,
+    mesh = None,
+    eps = 1e-6,
+):
+    """Fault: every rank's local squares summed over tp, so replicated gradients count once per rank."""
+    import torch.distributed as dist
+
+    params = [p for p in parameters if p.grad is not None]
+    total = torch.zeros(())
+    for p in params:
+        p.grad = tpn._replicate_grad(p.grad)
+        g = p.grad.to_local() if tpn._is_dtensor(p.grad) else p.grad
+        total = total + g.float().square().sum()
+    dist.all_reduce(total)
+    total = total.sqrt()
+    tpn._scale_grads_(params, total, max_norm, eps)
+    return total
+
+
+def _case_trainer(
+    rank,
+    world,
+    tmp,
+    steps = 6,
+    max_grad_norm = 0.05,
+    fault = None,
+):
+    """transformers Trainer (Accelerator hooks, tp clipping, logged grad_norm), one process or tp over world."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from transformers import Trainer, TrainerCallback, TrainingArguments
+
+    ids, labels = batch(2)
+    rows = [{"input_ids": ids[i], "labels": labels[i]} for i in range(ids.shape[0])]
+    model = build()
+    full = lambda g, p: g
+    tensor_parallel = world > 1
+    if tensor_parallel:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names = ("tp",))["tp"]
+        model = tpn.apply_tensor_parallel(model, mesh)
+        assert tpn.tp_trainer_setup(model, phase = "pre")
+        full = tpn._full
+    if fault == "replicated_norm_per_rank":
+        tpn.tp_clip_grad_norm_ = _naive_clip
+    args = TrainingArguments(
+        output_dir = os.path.join(tmp, f"out{rank}"),
+        per_device_train_batch_size = len(rows),
+        max_steps = steps,
+        learning_rate = 1.0,
+        lr_scheduler_type = "constant",
+        optim = "sgd",  # step size = the clipped norm (Adam would normalize a wrong clip away)
+        max_grad_norm = max_grad_norm,  # below every step's norm: a wrong norm changes every update
+        logging_steps = 1,
+        report_to = "none",
+        save_strategy = "no",
+        use_cpu = True,
+        seed = 0,
+        dataloader_num_workers = 0,
+        remove_unused_columns = False,
+    )
+    grads = {}
+
+    class Grab(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, **kw):
+            if state.global_step == 0:
+                grads.update(_lora(model, full))
+
+    trainer = Trainer(model = model, args = args, train_dataset = rows, callbacks = [Grab()])
+    if tensor_parallel:
+        assert tpn.tp_trainer_setup(phase = "post", trainer = trainer)
+    trainer._get_train_sampler = lambda *a, **k: torch.utils.data.SequentialSampler(rows)
+    trainer.train()
+    hist = [h for h in trainer.state.log_history if "loss" in h]
+    return {
+        "losses": [h["loss"] for h in hist],
+        "grad_norms": [h["grad_norm"] for h in hist],
+        "grads": grads,
+    }
+
+
+CASES = {
+    "parity": _case_parity,
+    "attention_units": _case_attention_units,
+    "trainer": _case_trainer,
+}
 
 
 def _worker(rank, world, port, case, tmp, kwargs):
@@ -468,6 +612,10 @@ CELLS = {
     "pp4_gpipe_mb4": dict(world = 4, mode = "pp", n_mb = 4),
     "pp2x2_interleaved1f1b": dict(world = 2, mode = "pp", schedule = "interleaved1f1b", n_mb = 4),
     "pp2x2_zbv": dict(world = 2, mode = "pp", schedule = "zbvzerobubble", n_mb = 4),
+    "pp2_gpipe_mb4_gc": dict(world = 2, mode = "pp", n_mb = 4, gc = True),
+    "pp2_1f1b_gc": dict(world = 2, mode = "pp", schedule = "1f1b", gc = True),
+    "pp2_gpipe_experts": dict(world = 2, mode = "pp", experts = True),
+    "pp2_1f1b_experts_gc": dict(world = 2, mode = "pp", schedule = "1f1b", experts = True, gc = True),
 }
 
 
@@ -518,6 +666,20 @@ def test_deepseek_v41_parallel_matches_one_process(cell):
                 assert (kind != "_PPTableStub") == owner, (key, kind, info["owned"])
             # the stages ran through the model's own pipeline_stage_forward, not the pass-through fallback
             assert info["stage_forward"]
+            # one stage call per micro-batch and step; each rank holds and steps its own layers' adapters only
+            n_stages = len(info["bounds"]) // world  # stages on this rank
+            assert info["stage_calls"] == kwargs.get("n_mb", 2) * 2 * n_stages, info["stage_calls"]
+            assert set(info["param_layers"]) == set(info["owned"]), (
+                info["param_layers"],
+                info["owned"],
+            )
+            if kwargs.get("gc"):
+                assert info["replays"] > 0  # zoo's checkpoint replay ran the recompute
+        assert sorted(sum((i["owned"] for i in infos), [])) == list(
+            range(_config().text_config.num_hidden_layers)
+        )
+    if kwargs.get("experts"):
+        assert any(".mlp.experts." in n for n in ref["trainable"])
 
 
 def test_pp_cut_at_an_unsafe_layer_breaks_parity():
@@ -538,6 +700,13 @@ def test_pp_cut_at_an_unsafe_layer_breaks_parity():
     ), errors
 
 
+def test_pp_reentrant_checkpoint_without_the_replay_breaks_parity():
+    """Flip: without zoo's non-reentrant replay the layers reading a source layer's shared KV send it no gradient."""
+    results = _spawn("parity", 2, mode = "pp", gc = True, fault = "reentrant_no_replay")
+    problems = _parity_problems(results, "pp_reentrant")
+    assert any("kv_proj" in p for p in problems), problems
+
+
 def test_tp_without_the_replicated_gradient_sum_breaks_parity():
     """Flip: without the tp sum the shared latent / kv head / compressor gradients stay partial."""
     results = _spawn("parity", 2, mode = "tp", fault = "no_replicated_grad_sum")
@@ -545,6 +714,52 @@ def test_tp_without_the_replicated_gradient_sum_breaks_parity():
     assert any(".kv_proj." in p for p in problems) and any(
         ".q_a_proj." in p for p in problems
     ), problems
+
+
+def _trainer_problems(ref, got):
+    problems = []
+    if got["losses"] != pytest.approx(ref["losses"], rel = 1e-5):
+        problems.append(f"losses {got['losses']} vs {ref['losses']}")
+    # Past step 1 the weights differ by fp32 order noise, which can flip a router / indexer top-k.
+    if got["grad_norms"][0] != pytest.approx(ref["grad_norms"][0], rel = 1e-5) or got["grad_norms"][
+        1:
+    ] != pytest.approx(ref["grad_norms"][1:], rel = 1e-2):
+        problems.append(f"grad_norms {got['grad_norms']} vs {ref['grad_norms']}")
+    if set(ref["grads"]) != set(got["grads"]):
+        problems.append(
+            f"gradient sets differ: {sorted(set(ref['grads']) ^ set(got['grads']))[:6]}"
+        )
+    for name, want in ref["grads"].items():
+        have = got["grads"].get(name)
+        scale = float(want.abs().max())
+        if have is not None and float((have - want).abs().max()) > 1e-7 + 1e-4 * scale:
+            problems.append(
+                f"{name}: gradient off by {float((have - want).abs().max()) / scale:.2e}"
+            )
+    return problems
+
+
+def test_tp_trainer_matches_one_process():
+    """The Trainer path: per-parameter clipped step-1 gradients, the logged grad_norm and 6 clipped steps."""
+    pytest.importorskip("accelerate")
+    (ref,) = _spawn("trainer", 1)
+    results = _spawn("trainer", 2)
+    assert len(ref["losses"]) == 6 and min(ref["grad_norms"]) > 0.05  # clipping engaged
+    assert any(".o_a_proj.lora_B" in n for n in ref["grads"])
+    for res in results:
+        assert _trainer_problems(ref, res) == []
+
+
+def test_tp_trainer_norm_counting_replicas_per_rank_breaks_parity():
+    """Flip: a norm that sums every rank's replicated gradients over tp is larger and clips differently."""
+    pytest.importorskip("accelerate")
+    (ref,) = _spawn("trainer", 1)
+    (res, _) = _spawn("trainer", 2, fault = "replicated_norm_per_rank")
+    assert res["grad_norms"][0] > ref["grad_norms"][0] * 1.05, (
+        res["grad_norms"],
+        ref["grad_norms"],
+    )
+    assert any("gradient off" in p for p in _trainer_problems(ref, res))
 
 
 def test_pp_refuses_layers_per_stage_at_an_unsafe_cut():
@@ -634,10 +849,14 @@ def _fake_stage(carry = None, segments = None):
         is_last = False,
         start = 0,
         end = 2,
+        wire_dtypes = None,
     )
-    return types.SimpleNamespace(
+    stage = types.SimpleNamespace(
         _pp_ctx = ctx, _pp_dtype = torch.float32, _pp_warned = False, _wire = lambda t: t
     )
+    stage._publish = lambda t: ppn._PPStageModule._publish(stage, t)
+    stage._restore = lambda t: ppn._PPStageModule._restore(stage, t)
+    return stage
 
 
 def test_pp_boundary_compiles_in_one_graph():

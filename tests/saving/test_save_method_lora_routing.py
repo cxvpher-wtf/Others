@@ -38,10 +38,14 @@ def _load(*names, **env):
     # GGUF path; none of these fixtures is a Mistral-format view, so it never refuses here.
     namespace = {
         "raise_if_merging_mistral_format_view": lambda model, save_method: None,
+        # Same for the Inkling 2 merge refusal: no fixture is an Inkling 2 model.
+        "raise_if_merging_inkling2": lambda model, save_method: None,
         "lora_relative_to_original_base": lambda model: contextlib.nullcontext(),
         # Unmerges FSDP2 streamed layers when a save raises; these fixtures never stream.
         "_unmerge_flags_on_error": lambda streamed: contextlib.nullcontext(),
         "nullcontext": contextlib.nullcontext,
+        # unsloth_save_model frees the training-time NF4 dequant cache first (#18285); none here.
+        "_release_nf4_dequant_cache": lambda: None,
         # Full saves add bare Params4bit quant state (fused 4-bit experts); none in these fixtures.
         "PeftModel": type("PeftModel", (), {}),
         "_save_bare_params4bit_quant_state": lambda model: contextlib.nullcontext(),
@@ -222,6 +226,8 @@ _GENERIC_SAVE_STUBBED_HELPERS = frozenset(
         # LFM3-Audio config rewrite: no LFM3-Audio checkpoint in these fixtures.
         "_release_layout_for_merged_save",
         "_push_lfm3_audio_release_config",
+        # Shard-wise cast: these fixtures hold no real tensors, so the eager cast runs.
+        "_restamp_index_total_size",
         # Decorator factory; _load strips decorators.
         "_model_parallel_refuses_save",
     }
@@ -264,6 +270,8 @@ def _routing_environment(monkeypatch, model):
         _mtp_head_tensor_names = lambda model: [],
         _release_layout_for_merged_save = lambda model, directory, method: False,
         _push_lfm3_audio_release_config = lambda model, save_directory, token = None: False,
+        _restamp_index_total_size = _not_reached,
+        _CastShardsOnWrite = _not_reached,
         lora_relative_to_original_base = lambda model: (
             calls["convert"].append(model) or contextlib.nullcontext()
         ),

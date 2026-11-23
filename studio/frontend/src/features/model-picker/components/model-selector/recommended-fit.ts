@@ -12,6 +12,7 @@ import {
 } from "../../../../lib/vram.ts";
 import {
   audioCppDisplayName,
+  audioCppModelFor,
   isAudioCppFolderId,
 } from "../../../audio/audio-cpp-catalog.ts";
 import {
@@ -24,7 +25,12 @@ import {
   type curatedArtifactFit,
 } from "./model-catalog.ts";
 
-export { hasMlxCardTag, isMlxId } from "../../../hub/lib/format-filters.ts";
+export {
+  cachedRepoIsMlx,
+  hasMlxCardTag,
+  isMlxId,
+  localRowIsMlx,
+} from "../../../hub/lib/format-filters.ts";
 
 const GGUF_SUFFIX_RE = /-GGUF(?:$|-)/i;
 
@@ -133,7 +139,10 @@ export function pickerSearchMatches(
     const name = audioCppDisplayName(id);
     return (
       normalizeSearchText(name.replace(/-gguf$/i, "")).includes(q) ||
-      (!"gguf".includes(q) && normalizeSearchText(name).includes(q))
+      (!"gguf".includes(q) && normalizeSearchText(name).includes(q)) ||
+      (audioCppModelFor(id)?.keywords ?? []).some((term) =>
+        normalizeSearchText(term).includes(q),
+      )
     );
   }
   return (label ? [...aliases, label] : aliases).some((term) =>
