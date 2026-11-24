@@ -519,6 +519,8 @@ export function ChatSettingsPanel({
   const uiSpaceScale = useUiSpaceScale();
   const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
   const loadedIsGguf = useChatRuntimeStore((s) => s.loadedIsGguf);
+  // A decision model has no text generation: sampling, prompts, tools and retrieval do not apply.
+  const loadedIsDecision = useChatRuntimeStore((s) => s.loadedIsDecision);
   const activeNativePathToken = useChatRuntimeStore(
     (s) => s.activeNativePathToken,
   );
@@ -1249,6 +1251,7 @@ export function ChatSettingsPanel({
           </CollapsibleSection>
         )}
 
+        {!loadedIsDecision && (
         <CollapsibleSection
           label="Preset"
           headerAction={
@@ -1386,6 +1389,7 @@ export function ChatSettingsPanel({
             </div>
           </div>
         </CollapsibleSection>
+        )}
 
         {showPromptCachingControl && activeExternalProvider ? (
           <CollapsibleSection label="Provider" defaultOpen={true}>
@@ -1488,6 +1492,8 @@ export function ChatSettingsPanel({
           </CollapsibleSection>
         ) : null}
 
+        {!loadedIsDecision && (
+        <>
         <CollapsibleSection
           label="System Prompt"
           defaultOpen={true}
@@ -1755,6 +1761,9 @@ export function ChatSettingsPanel({
             <RetrievalSettingsSection />
           </CollapsibleSection>
             )}
+
+        </>
+        )}
 
         {modelInfo && (
           <CollapsibleSection label="Information">{modelInfo}</CollapsibleSection>
