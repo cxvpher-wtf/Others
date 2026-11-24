@@ -6121,6 +6121,8 @@ export function createOpenAIStreamAdapter(
             contextWindowExceeded,
           ),
         },
+        // Labels a reply while it streams or after a Stop, before responseDetails is recorded.
+        runModelId: params.checkpoint,
         ...generationCustom(),
       });
       let incompleteReason: IncompleteReason | null = null;
@@ -9329,6 +9331,7 @@ export function createOpenAIStreamAdapter(
               timing: partialTiming,
               custom: {
                 ...reasoningDurationTracker.metadata(),
+                runModelId: params.checkpoint,
                 contextTruncation,
                 compactionMarkers,
                 providerCompaction,
