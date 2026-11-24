@@ -138,6 +138,14 @@ def test_storage_round_trips_and_updates_the_flag(tmp_path):
     assert studio_db.list_scan_folders()[0]["recursive"] is False
 
 
+def test_storage_defaults_to_recursive_on_new_registration(tmp_path):
+    folder = tmp_path / "new_models"
+    folder.mkdir()
+    row, changed = studio_db.add_scan_folder_with_status(str(folder))
+    assert changed and row["recursive"] == 1
+    assert studio_db.list_scan_folders()[0]["recursive"] is True
+
+
 def test_hub_storage_shares_the_flag(tmp_path):
     from hub.storage import scan_folders
 
@@ -210,3 +218,36 @@ def test_compat_nested_rows_keep_the_cap_with_a_nested_hf_cache(tmp_path):
         (repo / "refs" / "main").write_text("abc", encoding = "utf-8")
     assert len(models_routes._scan_nested_compat_rows(tmp_path, [], limit = 5)) == 5
     assert len(models_routes._scan_nested_compat_rows(tmp_path, [], limit = 3)) == 3
+
+
+@pytest.mark.anyio
+async def test_main_models_folder_discovers_loose_ggufs(tmp_path, monkeypatch):
+    from utils.hf_cache_settings import HuggingFaceCachePaths
+
+    cache_home = tmp_path / "custom_models_home"
+    cache_home.mkdir()
+    hub_cache = cache_home / "hub"
+    hub_cache.mkdir()
+
+    direct_gguf = _gguf(cache_home / "direct-Q4_K_M.gguf")
+    hub_gguf = _gguf(hub_cache / "hub-Q4_K_M.gguf")
+
+    monkeypatch.setattr(
+        "utils.hf_cache_settings.get_hf_cache_paths",
+        lambda: HuggingFaceCachePaths(cache_home, hub_cache, cache_home / "xet", "studio"),
+    )
+
+    models = await local_inventory._collect_models_from_default_sources(
+        models_root = tmp_path / "models",
+        hf_cache_dir = hub_cache,
+        legacy_hf = tmp_path / "legacy",
+        hf_default = tmp_path / "default",
+        lm_dirs = (),
+        ollama_dirs = (),
+        hermes_dirs = (),
+        known_hf_caches = (),
+        custom_folders = [],
+    )
+    found_paths = {Path(m.path).resolve() for m in models}
+    assert direct_gguf.resolve() in found_paths
+    assert hub_gguf.resolve() in found_paths

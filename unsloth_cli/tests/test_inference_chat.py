@@ -171,6 +171,9 @@ def test_inference_exposes_gguf_runtime_options():
     draft_n = _option(inference, "spec_draft_n_max")
     assert "--spec-draft-n-max" in (getattr(draft_n, "param_decls", None) or [])
 
+    models_dir = _option(inference, "models_dir")
+    assert "--models-dir" in (getattr(models_dir, "param_decls", None) or [])
+
 
 def test_mlx_distributed_info_reads_launch_env(monkeypatch, tmp_path):
     _clear_mlx_distributed_env(monkeypatch)
@@ -235,6 +238,9 @@ def test_chat_command_is_registered_with_options():
     assert "--speculative-type" in (getattr(spec_type, "param_decls", None) or [])
     draft_n = _option(chatmod.chat, "spec_draft_n_max")
     assert "--spec-draft-n-max" in (getattr(draft_n, "param_decls", None) or [])
+
+    models_dir = _option(chatmod.chat, "models_dir")
+    assert "--models-dir" in (getattr(models_dir, "param_decls", None) or [])
 
 
 class _FakeBackend:
