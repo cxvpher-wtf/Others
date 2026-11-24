@@ -2128,6 +2128,10 @@ def _resident_load_target(models: list, status: dict, allow_casefold: bool):
             )
         return None, None
     identifier = status.get("model_identifier")
+    quant = status.get("gguf_variant")
+    if identifier and quant and identifier.casefold().endswith(f":{quant}".casefold()):
+        if _is_hub_model_id(identifier[: -len(quant) - 1]):
+            identifier = identifier[: -len(quant) - 1]
     if identifier:
         return identifier, public_id
     # A native path lease redacts the internal path; inventing one from the basename would address the wrong file, so only a hub id can be posted back.
@@ -2350,6 +2354,30 @@ def _load_settings_differ(status: dict, load: LoadOptions, overrides: frozenset)
                 return True
             # Manual to manual is a real no-op: the payload only sends the implicit gpu_layers = -1 when switching INTO manual, so a resident already pinned to a layer count keeps it through the round-trip and nothing changes.
     return False
+
+
+def _pin_loaded_quant(
+    entry: dict,
+    models: list,
+    variant: str,
+    gguf: bool = False,
+) -> dict:
+    """A bare repo id reaches whichever of its loaded quants was used last, so name the chosen one."""
+    model_id = str(entry.get("id") or "")
+    if not model_id or model_id.casefold().endswith(f":{variant}".casefold()):
+        return entry
+    pinned = f"{model_id}:{variant}"
+    loaded = [m for m in models if m.get("loaded") is not False]
+    named = next(
+        (m for m in loaded if str(m.get("id") or "").casefold() == pinned.casefold()), None
+    )
+    if named is not None:
+        return named
+    prefix = f"{model_id}:".casefold()
+    sibling = any(str(m.get("id") or "").casefold().startswith(prefix) for m in loaded)
+    # Pinned up front too: a sibling loaded later would take the agent's bare id mid-session.
+    alone = gguf and _is_hub_model_id(model_id)
+    return {**entry, "id": pinned} if sibling or alone else entry
 
 
 def _resolve_model(
@@ -5405,6 +5433,9 @@ def _connect(
             # That server was started FROM these knobs, so inferring a target here would reload what was just loaded.
             infer_resident = server is None,
         )
+        if load.gguf_variant:
+            gguf = bool(_inference_status(base, key, entry["id"]).get("is_gguf"))
+            entry = _pin_loaded_quant(entry, _loaded_models(base, key), load.gguf_variant, gguf)
         status = _inference_status(base, key, entry["id"]) if model else {}
         # A GGUF can be active while the resolved entry is another resident model.
         if status.get("memory_warning") and any(
