@@ -961,6 +961,7 @@ export const fr = {
     error: "Erreur",
     export: "Exporter",
     help: "Aide",
+    hide: "Masquer",
     todayAt: "Aujourd’hui, {time}",
     yesterdayAt: "Hier, {time}",
     loading: "Chargement...",

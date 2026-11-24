@@ -1065,6 +1065,7 @@ export const es419 = {
     error: "Error",
     export: "Exportar",
     help: "Ayuda",
+    hide: "Ocultar",
     todayAt: "Hoy, {time}",
     yesterdayAt: "Ayer, {time}",
     loading: "Cargando...",
