@@ -3774,7 +3774,7 @@ def test_recall_searches_the_users_question_not_the_loops_own_notices(monkeypatc
     must still search the archive for what the user asked (#16187)."""
     from core.rag import conversation_archive
 
-    rounds = 4
+    rounds = 3
     payloads: list[dict] = []
     streams = [
         [
@@ -5666,7 +5666,8 @@ def test_gguf_valid_tool_calls_respect_max_tool_iterations(monkeypatch):
     )
 
     assert len(calls) == 2, calls
-    assert len(payloads) == 3, len(payloads)
+    assert len(payloads) == 4, len(payloads)
+    assert "tools" not in payloads[3]
     # The final pass may not call tools (it keeps the schemas for the cache). Its controller feedback stays in
     # the latest tool result rather than opening a newer user turn.
     assert payloads[2]["tool_choice"] == "none", payloads[2].get("tool_choice")
@@ -6697,6 +6698,9 @@ def _two_edits_in_one_turn():
 def test_a_second_call_in_a_compacted_turn_is_still_visible_to_the_model(monkeypatch):
     """Compaction rebuilds the messages, so a call after it must not append to a stale message dict."""
 
+    from core.inference.context_window import message_source
+
+    source_messages = []
     payloads: list[dict] = []
     backend = _make_backend(
         monkeypatch,
@@ -6718,6 +6722,9 @@ def test_a_second_call_in_a_compacted_turn_is_still_visible_to_the_model(monkeyp
             messages = [{"role": "user", "content": "Write the game"}],
             tools = [{"type": "function", "function": {"name": "edit_file"}}],
             max_tool_iterations = 4,
+            on_conversation_grew = lambda messages: source_messages.extend(
+                message_source(m) for m in messages if m.get("tool_calls")
+            ),
         )
     )
 
@@ -6733,6 +6740,8 @@ def test_a_second_call_in_a_compacted_turn_is_still_visible_to_the_model(monkeyp
     assert answered, "no tool result reached the model at all"
     assert answered <= announced, f"results with no visible call: {answered - announced}"
     assert _BIG_BODY not in json.dumps(sent)
+    assert [c["id"] for c in source_messages[-1]["tool_calls"]] == ["call_big", "call_small"]
+    assert _BIG_BODY in json.dumps(source_messages[-1])
 
 
 def test_the_synthesized_final_pass_is_recosted_before_it_is_sent(monkeypatch):
